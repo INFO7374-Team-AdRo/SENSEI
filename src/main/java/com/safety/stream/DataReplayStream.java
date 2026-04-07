@@ -6,7 +6,8 @@ import akka.cluster.sharding.typed.javadsl.EntityRef;
 import akka.stream.javadsl.Source;
 import com.opencsv.CSVReader;
 import com.opencsv.CSVReaderBuilder;
-import com.safety.protocol.SensorProtocol;
+import com.safety.agents.SensorAgent;
+import com.safety.agents.FusionAgent;
 
 import java.io.FileReader;
 import java.time.Duration;
@@ -20,17 +21,19 @@ public class DataReplayStream {
     private final ClusterSharding sharding;
     private final String csvPath;
     private final long replayIntervalMs;
+    private final akka.actor.typed.ActorRef<FusionAgent.Command> fusionAgent;
 
-    // CSV column order: Serial Number, MQ2, MQ3, MQ5, MQ6, MQ7, MQ8, MQ135, Gas, Image
     private static final String[] SENSOR_TYPES = {"MQ2", "MQ3", "MQ5", "MQ6", "MQ7", "MQ8", "MQ135"};
     private static final int[] SENSOR_COLUMNS = {1, 2, 3, 4, 5, 6, 7};
 
     public DataReplayStream(ActorSystem<?> system, ClusterSharding sharding,
-                            String csvPath, long replayIntervalMs) {
+                            String csvPath, long replayIntervalMs,
+                            akka.actor.typed.ActorRef<FusionAgent.Command> fusionAgent) {
         this.system = system;
         this.sharding = sharding;
         this.csvPath = csvPath;
         this.replayIntervalMs = replayIntervalMs;
+        this.fusionAgent = fusionAgent;
     }
 
     // Holds one row of parsed sensor data + label
@@ -77,6 +80,13 @@ public class DataReplayStream {
         system.log().info("Starting data replay: {} rows at {}ms intervals",
             rows.size(), replayIntervalMs);
 
+        // First, tell each sensor shard where the fusion agent is
+        for (String sensorType : SENSOR_TYPES) {
+            EntityRef<SensorAgent.Command> sensorRef =
+                sharding.entityRefFor(SensorAgent.ENTITY_KEY, sensorType);
+            sensorRef.tell(new SensorAgent.SetFusionRef(fusionAgent));
+        }
+
         // Create a ticking source that emits one row at a time
         Source.from(rows)
             .throttle(1, Duration.ofMillis(replayIntervalMs))
@@ -88,13 +98,10 @@ public class DataReplayStream {
                     String sensorType = SENSOR_TYPES[i];
                     int value = row.sensorValues()[i];
 
-                    EntityRef<SensorProtocol.SensorReading> sensorRef =
-                        sharding.entityRefFor(
-                            com.safety.agents.SensorAgent.ENTITY_KEY,
-                            sensorType
-                        );
+                    EntityRef<SensorAgent.Command> sensorRef =
+                        sharding.entityRefFor(SensorAgent.ENTITY_KEY, sensorType);
 
-                    sensorRef.tell(new SensorProtocol.SensorReading(
+                    sensorRef.tell(new SensorAgent.ProcessReading(
                         sensorType, value, now
                     ));
                 }

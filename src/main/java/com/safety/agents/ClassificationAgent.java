@@ -96,6 +96,8 @@ public class ClassificationAgent extends AbstractBehavior<ClassificationProtocol
         return this;
     }
 
+    private static final String[] CLASS_LABELS = {"Mixture", "NoGas", "Perfume", "Smoke"};
+
     private ClassResult classifyWithModel(FusionProtocol.FusedEvent fused) {
         try {
             Map<String, Object> input = new LinkedHashMap<>();
@@ -106,21 +108,25 @@ public class ClassificationAgent extends AbstractBehavior<ClassificationProtocol
                 input.put(sensor, value);
             }
 
-            // Evaluate using JPMML
             Map<String, ?> results = evaluator.evaluate(input);
 
-            // Extract predicted class
             List<? extends TargetField> targetFields = evaluator.getTargetFields();
             String targetName = targetFields.get(0).getName();
             Object prediction = results.get(targetName);
-            String label = prediction.toString();
+            String rawLabel = prediction.toString();
 
-            // Clean up label if it has extra wrapper
-            if (label.contains("=")) {
-                label = label.substring(label.indexOf("=") + 1).replace("}", "").trim();
+            // Map numeric index to class name if needed
+            String label = rawLabel;
+            try {
+                int idx = Integer.parseInt(rawLabel.replaceAll("[^0-9]", ""));
+                if (idx >= 0 && idx < CLASS_LABELS.length) {
+                    label = CLASS_LABELS[idx];
+                }
+            } catch (NumberFormatException e) {
+                // Already a string label, use as-is
             }
 
-            // Try to get probability from output fields
+            // Get max probability
             double prob = 0.85;
             List<? extends OutputField> outputFields = evaluator.getOutputFields();
             for (OutputField of : outputFields) {

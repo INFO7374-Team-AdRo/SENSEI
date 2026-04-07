@@ -15,35 +15,70 @@ import java.util.Map;
 
 public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
 
-    // Commands this agent accepts
     public interface Command {}
-
     public record SensorUpdate(SensorProtocol.SensorEvent event) implements Command {}
     public record ThermalUpdate(ThermalProtocol.ThermalEvent event) implements Command {}
     private record FlushWindow() implements Command {}
 
-    // Time window for correlation
     private static final Duration WINDOW_DURATION = Duration.ofSeconds(5);
 
-    // Current window state
     private final Map<String, SensorProtocol.SensorEvent> currentSensorEvents = new HashMap<>();
     private ThermalProtocol.ThermalEvent currentThermalEvent = null;
     private Instant windowStart = Instant.now();
 
-    // Downstream
+    // Downstream — wraps ClassificationAgent to handle reply
     private final ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent;
+    private final ActorRef<ClassificationProtocol.ClassificationResult> classificationResultAdapter;
+
+    // Next hop after classification
+    private final ActorRef<RetrievalAgent.Command> retrievalAgent;
+    private final ActorRef<LLMProtocol.Command> llmAgent;
+    private final ActorRef<EscalationProtocol.EscalationRequest> escalationAgent;
 
     public static Behavior<Command> create(
-            ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent) {
-        return Behaviors.setup(ctx -> new FusionAgent(ctx, classificationAgent));
+            ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent,
+            ActorRef<RetrievalAgent.Command> retrievalAgent,
+            ActorRef<LLMProtocol.Command> llmAgent,
+            ActorRef<EscalationProtocol.EscalationRequest> escalationAgent) {
+        return Behaviors.setup(ctx -> new FusionAgent(ctx, classificationAgent,
+            retrievalAgent, llmAgent, escalationAgent));
     }
 
     private FusionAgent(ActorContext<Command> context,
-                        ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent) {
+                        ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent,
+                        ActorRef<RetrievalAgent.Command> retrievalAgent,
+                        ActorRef<LLMProtocol.Command> llmAgent,
+                        ActorRef<EscalationProtocol.EscalationRequest> escalationAgent) {
         super(context);
         this.classificationAgent = classificationAgent;
+        this.retrievalAgent = retrievalAgent;
+        this.llmAgent = llmAgent;
+        this.escalationAgent = escalationAgent;
+
+        // Create adapter to receive classification results back
+        this.classificationResultAdapter = context.messageAdapter(
+            ClassificationProtocol.ClassificationResult.class,
+            result -> new ClassificationResultReceived(result)
+        );
+
         context.getLog().info("FusionAgent started — window: {}s", WINDOW_DURATION.getSeconds());
     }
+
+    // Internal message for classification result callback
+    private record ClassificationResultReceived(
+        ClassificationProtocol.ClassificationResult result
+    ) implements Command {}
+
+    // Internal message for retrieval result callback
+    private record RetrievalResultReceived(
+        RetrievalProtocol.RetrievalResult result
+    ) implements Command {}
+
+    // Internal message for LLM reasoning result callback
+    private record ReasoningResultReceived(
+        LLMProtocol.ReasoningResult result,
+        ClassificationProtocol.ClassificationResult classification
+    ) implements Command {}
 
     @Override
     public Receive<Command> createReceive() {
@@ -51,6 +86,9 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
             .onMessage(SensorUpdate.class, this::onSensorUpdate)
             .onMessage(ThermalUpdate.class, this::onThermalUpdate)
             .onMessage(FlushWindow.class, this::onFlush)
+            .onMessage(ClassificationResultReceived.class, this::onClassificationResult)
+            .onMessage(RetrievalResultReceived.class, this::onRetrievalResult)
+            .onMessage(ReasoningResultReceived.class, this::onReasoningResult)
             .build();
     }
 
@@ -67,14 +105,11 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
     }
 
     private Behavior<Command> onFlush(FlushWindow msg) {
-        if (!currentSensorEvents.isEmpty()) {
-            emitFusedEvent();
-        }
+        if (!currentSensorEvents.isEmpty()) emitFusedEvent();
         return this;
     }
 
     private void checkAndFuse() {
-        // Fuse when we have all 7 sensors + thermal, or window expires
         boolean allSensors = currentSensorEvents.size() >= 7;
         boolean hasThermal = currentThermalEvent != null;
         boolean windowExpired = Duration.between(windowStart, Instant.now())
@@ -88,7 +123,6 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
     private void emitFusedEvent() {
         if (currentSensorEvents.isEmpty()) return;
 
-        // Calculate fusion confidence
         double confidence = calculateConfidence();
 
         var fusedEvent = new FusionProtocol.FusedEvent(
@@ -98,15 +132,15 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
             Instant.now()
         );
 
-        getContext().getLog().info("FUSED EVENT: confidence={:.2f} sensors={} thermal={}",
-            confidence, currentSensorEvents.size(), currentThermalEvent != null);
+        getContext().getLog().info("FUSED EVENT: confidence={} sensors={} thermal={}",
+            String.format("%.2f", confidence),
+            currentSensorEvents.size(),
+            currentThermalEvent != null);
 
-        // Send to Classification Agent
-        if (classificationAgent != null) {
-            // ClassifyRequest needs a replyTo — we'll handle this with ask pattern or adapter
-            // For now, log it
-            getContext().getLog().debug("Sending fused event to classification");
-        }
+        // Send to Classification Agent with reply adapter
+        classificationAgent.tell(new ClassificationProtocol.ClassifyRequest(
+            fusedEvent, classificationResultAdapter
+        ));
 
         // Reset window
         currentSensorEvents.clear();
@@ -114,8 +148,66 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
         windowStart = Instant.now();
     }
 
+    // Step 2: Classification result received → send to Retrieval
+    private Behavior<Command> onClassificationResult(ClassificationResultReceived msg) {
+        var result = msg.result();
+        getContext().getLog().info("Classification: {} confidence={}",
+            result.hazardClass(), String.format("%.2f", result.confidence()));
+
+        // Only escalate if confidence > 0.5
+        if (result.confidence() > 0.5 && !"NoGas".equals(result.hazardClass())) {
+            // Create adapter for retrieval result
+            ActorRef<RetrievalProtocol.RetrievalResult> retrievalAdapter =
+                getContext().messageAdapter(
+                    RetrievalProtocol.RetrievalResult.class,
+                    rr -> new RetrievalResultReceived(rr)
+                );
+
+            retrievalAgent.tell(new RetrievalAgent.Retrieve(
+                new RetrievalProtocol.RetrieveRequest(result, retrievalAdapter)
+            ));
+        } else {
+            getContext().getLog().debug("Low confidence or NoGas — skipping escalation");
+        }
+
+        return this;
+    }
+
+    // Step 3: Retrieval result received → send to LLM
+    private Behavior<Command> onRetrievalResult(RetrievalResultReceived msg) {
+        var result = msg.result();
+        getContext().getLog().info("Retrieved {} similar incidents",
+            result.similarIncidents().size());
+
+        // Create adapter for LLM reasoning result
+        ActorRef<LLMProtocol.ReasoningResult> reasoningAdapter =
+            getContext().messageAdapter(
+                LLMProtocol.ReasoningResult.class,
+                rr -> new ReasoningResultReceived(rr, result.classification())
+            );
+
+        llmAgent.tell(new LLMProtocol.ReasoningRequest(result, reasoningAdapter));
+
+        return this;
+    }
+
+    // Step 4: Reasoning result received → send to Escalation
+    private Behavior<Command> onReasoningResult(ReasoningResultReceived msg) {
+        var reasoning = msg.result();
+        var classification = msg.classification();
+
+        getContext().getLog().info("LLM reasoning: {} severity={} steps={}",
+            reasoning.hazardType(), reasoning.severity(), reasoning.reasoningSteps());
+
+        // Send to Escalation Agent
+        escalationAgent.tell(new EscalationProtocol.EscalationRequest(
+            reasoning, classification
+        ));
+
+        return this;
+    }
+
     private double calculateConfidence() {
-        // Count how many sensors breached their threshold
         long breachedCount = currentSensorEvents.values().stream()
             .filter(SensorProtocol.SensorEvent::thresholdBreached)
             .count();
@@ -123,23 +215,15 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
         boolean thermalAnomaly = currentThermalEvent != null
             && currentThermalEvent.anomalyDetected();
 
-        // Confidence formula:
-        // - Base: proportion of sensors that breached
-        // - Boost if thermal confirms
-        // - Penalty if sensors disagree with thermal
         double sensorConfidence = (double) breachedCount / currentSensorEvents.size();
 
         if (thermalAnomaly && breachedCount > 0) {
-            // Both modalities agree — high confidence
             return Math.min(0.95, sensorConfidence * 1.3 + 0.2);
         } else if (thermalAnomaly && breachedCount == 0) {
-            // Thermal sees something, sensors don't — moderate uncertainty
             return 0.4;
         } else if (!thermalAnomaly && breachedCount > 0) {
-            // Sensors see something, thermal doesn't — moderate
             return sensorConfidence * 0.7;
         } else {
-            // Neither sees anything — low confidence (probably safe)
             return sensorConfidence * 0.3;
         }
     }

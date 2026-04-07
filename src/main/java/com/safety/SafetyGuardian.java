@@ -1,5 +1,5 @@
 package com.safety;
-import com.safety.http.SafetyHttpServer;
+
 import akka.actor.typed.ActorRef;
 import akka.actor.typed.ActorSystem;
 import akka.actor.typed.Behavior;
@@ -12,6 +12,7 @@ import akka.cluster.sharding.typed.javadsl.Entity;
 import com.safety.agents.*;
 import com.safety.clients.MistralClient;
 import com.safety.clients.QdrantClient;
+import com.safety.http.SafetyHttpServer;
 import com.safety.protocol.*;
 import com.safety.stream.DataReplayStream;
 import com.typesafe.config.Config;
@@ -20,6 +21,9 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
 
     public interface Command {}
     public record StartSystem() implements Command {}
+    private record IncidentReceived(OrchestratorProtocol.IncidentFinalized incident) implements Command {}
+
+    private boolean started = false;
 
     public static Behavior<Command> create() {
         return Behaviors.setup(SafetyGuardian::new);
@@ -35,10 +39,18 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
     public Receive<Command> createReceive() {
         return newReceiveBuilder()
             .onMessage(StartSystem.class, this::onStartSystem)
+            .onMessage(IncidentReceived.class, this::onIncidentReceived)
             .build();
     }
 
+    private Behavior<Command> onIncidentReceived(IncidentReceived msg) {
+        // Forward to orchestrator — handled silently
+        return this;
+    }
+
     private Behavior<Command> onStartSystem(StartSystem cmd) {
+        if (started) return this; // prevent double initialization
+        started = true;
         getContext().getLog().info("Initializing actor hierarchy...");
 
         Config config = getContext().getSystem().settings().config();
@@ -58,31 +70,41 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
             safetyConfig.getString("qdrant.collection")
         );
 
-        // --- Spawn agents (bottom-up: dependencies first) ---
+        // --- Spawn agents bottom-up (dependencies first) ---
 
-        // Retrieval Agent (needs Qdrant + Mistral for embedding)
+        // 1. Retrieval Agent (needs Qdrant + Mistral for embedding)
         ActorRef<RetrievalAgent.Command> retrievalAgent =
             getContext().spawn(RetrievalAgent.create(qdrant, mistral), "retrieval-agent");
 
-        // Orchestrator Agent (needs Retrieval for write-behind to Qdrant)
+        // 2. Orchestrator Agent (needs Retrieval for write-behind)
         ActorRef<OrchestratorAgent.Command> orchestratorAgent =
             getContext().spawn(OrchestratorAgent.create(retrievalAgent), "orchestrator-agent");
 
-        // LLM Reasoning Agent (needs Mistral)
+        // 3. LLM Reasoning Agent (needs Mistral)
         ActorRef<LLMProtocol.Command> llmReasoningAgent =
             getContext().spawn(LLMReasoningAgent.create(mistral), "llm-reasoning-agent");
 
-        // Escalation Agent (needs Orchestrator)
-        // Note: we need an adapter since Orchestrator accepts its own Command type
-        ActorRef<EscalationProtocol.EscalationRequest> escalationAgent =
-            getContext().spawn(EscalationAgent.create(
-                getContext().messageAdapter(
-                    OrchestratorProtocol.IncidentFinalized.class,
-                    inc -> new SafetyGuardian.Command() {} // placeholder
-                ).unsafeUpcast()
-            ), "escalation-agent");
+        // 4. Escalation Agent (needs Orchestrator)
+        ActorRef<OrchestratorProtocol.IncidentFinalized> orchestratorIncidentRef =
+            getContext().messageAdapter(
+                OrchestratorProtocol.IncidentFinalized.class,
+                inc -> new IncidentReceived(inc)
+            );
 
-     // Classification Agent (loads XGBoost PMML model)
+        // Create a direct ref that Escalation sends to Orchestrator
+        ActorRef<OrchestratorProtocol.IncidentFinalized> orchestratorDirectRef =
+            getContext().messageAdapter(
+                OrchestratorProtocol.IncidentFinalized.class,
+                inc -> {
+                    orchestratorAgent.tell(new OrchestratorAgent.IncidentMsg(inc));
+                    return new IncidentReceived(inc);
+                }
+            );
+
+        ActorRef<EscalationProtocol.EscalationRequest> escalationAgent =
+            getContext().spawn(EscalationAgent.create(orchestratorDirectRef), "escalation-agent");
+
+        // 5. Classification Agent
         ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent =
             getContext().spawn(
                 ClassificationAgent.create(
@@ -92,20 +114,31 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
                 "classification-agent"
             );
 
-     // Fusion Agent (wired to Classification)
+        // 6. Fusion Agent (wired to full downstream chain)
         ActorRef<FusionAgent.Command> fusionAgent =
-            getContext().spawn(FusionAgent.create(classificationAgent), "fusion-agent");
+            getContext().spawn(
+                FusionAgent.create(classificationAgent, retrievalAgent,
+                    llmReasoningAgent, escalationAgent),
+                "fusion-agent"
+            );
 
-        // Thermal Agent
+        // 7. Thermal Agent
         ActorRef<ThermalProtocol.ThermalFrame> thermalAgent =
             getContext().spawn(ThermalAgent.create(), "thermal-agent");
 
-        // Sensor Agent Sharding
+        // 8. Sensor Agent Sharding
         ClusterSharding sharding = ClusterSharding.get(getContext().getSystem());
         sharding.init(
             Entity.of(SensorAgent.ENTITY_KEY, entityContext ->
-                SensorAgent.create(entityContext.getEntityId(), null)
+                SensorAgent.create(entityContext.getEntityId())
             )
+        );
+
+        // --- Start HTTP server ---
+        SafetyHttpServer httpServer = new SafetyHttpServer(getContext().getSystem());
+        httpServer.start(
+            safetyConfig.getString("http.host"),
+            safetyConfig.getInt("http.port")
         );
 
         // --- Start data replay ---
@@ -113,16 +146,11 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         long replayInterval = safetyConfig.getLong("data.replay-interval-ms");
 
         DataReplayStream replay = new DataReplayStream(
-            getContext().getSystem(), sharding, csvPath, replayInterval
+            getContext().getSystem(), sharding, csvPath, replayInterval, fusionAgent
         );
         replay.startReplay();
-     // --- Start HTTP server ---
-        SafetyHttpServer httpServer = new SafetyHttpServer(getContext().getSystem());
-        httpServer.start(
-            safetyConfig.getString("http.host"),
-            safetyConfig.getInt("http.port")
-        );
-        getContext().getLog().info("All agents initialized. System ready.");
+
+        getContext().getLog().info("All agents initialized. Full pipeline wired. System ready.");
         return this;
     }
 

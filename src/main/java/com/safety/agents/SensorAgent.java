@@ -13,71 +13,70 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 
-public class SensorAgent extends AbstractBehavior<SensorProtocol.SensorReading> {
+public class SensorAgent extends AbstractBehavior<SensorAgent.Command> {
 
-    // Sharding entity key — each MQ sensor type is a separate shard
-    public static final EntityTypeKey<SensorProtocol.SensorReading> ENTITY_KEY =
-        EntityTypeKey.create(SensorProtocol.SensorReading.class, "SensorAgent");
+    // Sharding entity key
+    public static final EntityTypeKey<Command> ENTITY_KEY =
+        EntityTypeKey.create(Command.class, "SensorAgent");
 
-    // Rolling window for stats
+    // Commands
+    public interface Command {}
+
+    public record ProcessReading(
+        String sensorType, int valuePpm, Instant timestamp
+    ) implements Command {}
+
+    // Tells this shard where to send processed events
+    public record SetFusionRef(ActorRef<FusionAgent.Command> fusionAgent) implements Command {}
+
+    // Rolling window
     private static final int WINDOW_SIZE = 30;
     private final Deque<Integer> window = new ArrayDeque<>();
     private final String sensorType;
-    private final ActorRef<FusionProtocol.FusedEvent> fusionAgent;
-
-    // Thresholds per sensor type (ppm values)
     private final int dangerThreshold;
     private int previousValue = 0;
+    private ActorRef<FusionAgent.Command> fusionAgent;
 
-    public static Behavior<SensorProtocol.SensorReading> create(
-            String sensorType,
-            ActorRef<FusionProtocol.FusedEvent> fusionAgent) {
-        return Behaviors.setup(ctx -> new SensorAgent(ctx, sensorType, fusionAgent));
+    public static Behavior<Command> create(String sensorType) {
+        return Behaviors.setup(ctx -> new SensorAgent(ctx, sensorType));
     }
 
-    private SensorAgent(
-            ActorContext<SensorProtocol.SensorReading> context,
-            String sensorType,
-            ActorRef<FusionProtocol.FusedEvent> fusionAgent) {
+    private SensorAgent(ActorContext<Command> context, String sensorType) {
         super(context);
         this.sensorType = sensorType;
-        this.fusionAgent = fusionAgent;
         this.dangerThreshold = getThreshold(sensorType);
         context.getLog().info("SensorAgent [{}] started, threshold: {} ppm", sensorType, dangerThreshold);
     }
 
     @Override
-    public Receive<SensorProtocol.SensorReading> createReceive() {
+    public Receive<Command> createReceive() {
         return newReceiveBuilder()
-            .onMessage(SensorProtocol.SensorReading.class, this::onReading)
+            .onMessage(ProcessReading.class, this::onReading)
+            .onMessage(SetFusionRef.class, this::onSetFusion)
             .build();
     }
 
-    private Behavior<SensorProtocol.SensorReading> onReading(SensorProtocol.SensorReading reading) {
-        // Update rolling window
+    private Behavior<Command> onSetFusion(SetFusionRef msg) {
+        this.fusionAgent = msg.fusionAgent();
+        getContext().getLog().info("[{}] Fusion agent reference set", sensorType);
+        return this;
+    }
+
+    private Behavior<Command> onReading(ProcessReading reading) {
         window.addLast(reading.valuePpm());
         if (window.size() > WINDOW_SIZE) {
             window.removeFirst();
         }
 
-        // Compute rolling stats
         double avg = window.stream().mapToInt(Integer::intValue).average().orElse(0);
         double stdDev = computeStdDev(avg);
         boolean breached = reading.valuePpm() > dangerThreshold;
-
-        // Classify trend shape
         String trend = classifyTrend(reading.valuePpm());
         previousValue = reading.valuePpm();
 
-        // Emit processed event
         var event = new SensorProtocol.SensorEvent(
-            sensorType,
-            reading.valuePpm(),
-            avg,
-            stdDev,
-            breached,
-            trend,
-            reading.timestamp()
+            sensorType, reading.valuePpm(), avg, stdDev,
+            breached, trend, reading.timestamp()
         );
 
         if (breached) {
@@ -85,10 +84,10 @@ public class SensorAgent extends AbstractBehavior<SensorProtocol.SensorReading> 
                 sensorType, reading.valuePpm(), dangerThreshold);
         }
 
-        // Send to Fusion Agent (in full implementation, Fusion collects from all shards)
-        // For now, log it. Fusion Agent integration comes next.
-        getContext().getLog().debug("[{}] value={} avg={} trend={}",
-            sensorType, reading.valuePpm(), String.format("%.1f", avg), trend);
+        // Forward to Fusion Agent
+        if (fusionAgent != null) {
+            fusionAgent.tell(new FusionAgent.SensorUpdate(event));
+        }
 
         return this;
     }
@@ -104,8 +103,6 @@ public class SensorAgent extends AbstractBehavior<SensorProtocol.SensorReading> 
     private String classifyTrend(int currentValue) {
         if (window.size() < 5) return "stable";
         int delta = currentValue - previousValue;
-        double avgDelta = window.stream().mapToInt(Integer::intValue).average().orElse(0);
-        
         if (Math.abs(delta) > dangerThreshold * 0.3) return "sudden";
         if (Math.abs(delta) > dangerThreshold * 0.05) return "gradual";
         return "stable";
@@ -113,13 +110,13 @@ public class SensorAgent extends AbstractBehavior<SensorProtocol.SensorReading> 
 
     private static int getThreshold(String sensorType) {
         return switch (sensorType) {
-            case "MQ2"   -> 500;  // Flammable gases
-            case "MQ3"   -> 400;  // Alcohol/ethanol
-            case "MQ5"   -> 500;  // LPG/natural gas
-            case "MQ6"   -> 500;  // LPG/butane
-            case "MQ7"   -> 100;  // Carbon monoxide (most dangerous, lowest threshold)
-            case "MQ8"   -> 500;  // Hydrogen
-            case "MQ135" -> 400;  // Air quality
+            case "MQ2"   -> 500;
+            case "MQ3"   -> 400;
+            case "MQ5"   -> 500;
+            case "MQ6"   -> 500;
+            case "MQ7"   -> 100;
+            case "MQ8"   -> 500;
+            case "MQ135" -> 400;
             default      -> 500;
         };
     }
