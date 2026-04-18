@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SENSEI — Industrial Safety Monitoring</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <header>
+        <h1>Real-Time Industrial Safety Monitoring — SENSEI</h1>
+        <div class="header-info">
+            <span id="connection-status" class="status-badge disconnected">Disconnected</span>
+            <span id="event-count">Events: 0</span>
+            <span id="timestamp">--:--:--</span>
+        </div>
+    </header>
+
+    <div class="dashboard">
+        <div class="panel" id="agent-panel">
+            <h3>Agent Status</h3>
+            <div class="agent-grid">
+                <div class="agent-item" id="agent-SensorAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Sensor Agent</span>
+                    <span class="agent-detail">Sharded (MQ2-MQ135)</span>
+                </div>
+                <div class="agent-item" id="agent-ThermalAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Thermal Agent</span>
+                    <span class="agent-detail">Camera processing</span>
+                </div>
+                <div class="agent-item" id="agent-FusionAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Fusion Agent</span>
+                    <span class="agent-detail">Cross-modal correlation</span>
+                </div>
+                <div class="agent-item" id="agent-ClassificationAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Classification Agent</span>
+                    <span class="agent-detail">XGBoost / ONNX</span>
+                </div>
+                <div class="agent-item" id="agent-RetrievalAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Retrieval Agent</span>
+                    <span class="agent-detail">Qdrant RAG</span>
+                </div>
+                <div class="agent-item" id="agent-ReasoningAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">LLM Reasoning</span>
+                    <span class="agent-detail">Mistral API</span>
+                </div>
+                <div class="agent-item" id="agent-EscalationAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Escalation Agent</span>
+                    <span class="agent-detail">Tier policy</span>
+                </div>
+                <div class="agent-item" id="agent-OrchestratorAgent">
+                    <span class="status-dot"></span>
+                    <span class="agent-name">Orchestrator</span>
+                    <span class="agent-detail">Receptionist + AskPattern</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="sensor-panel">
+            <h3>Sensor Readings (ppm)</h3>
+            <div class="sensor-grid">
+                <div class="sensor-item" data-sensor="MQ2">
+                    <div class="sensor-header"><span class="sensor-label">MQ2</span><span class="sensor-type">Flammable Gas</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ2"></div></div>
+                    <span class="sensor-value" id="val-MQ2">0.0</span>
+                </div>
+                <div class="sensor-item" data-sensor="MQ3">
+                    <div class="sensor-header"><span class="sensor-label">MQ3</span><span class="sensor-type">Alcohol</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ3"></div></div>
+                    <span class="sensor-value" id="val-MQ3">0.0</span>
+                </div>
+                <div class="sensor-item" data-sensor="MQ5">
+                    <div class="sensor-header"><span class="sensor-label">MQ5</span><span class="sensor-type">LPG / Natural Gas</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ5"></div></div>
+                    <span class="sensor-value" id="val-MQ5">0.0</span>
+                </div>
+                <div class="sensor-item" data-sensor="MQ6">
+                    <div class="sensor-header"><span class="sensor-label">MQ6</span><span class="sensor-type">Butane / Propane</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ6"></div></div>
+                    <span class="sensor-value" id="val-MQ6">0.0</span>
+                </div>
+                <div class="sensor-item" data-sensor="MQ7">
+                    <div class="sensor-header"><span class="sensor-label">MQ7</span><span class="sensor-type">Carbon Monoxide</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ7"></div></div>
+                    <span class="sensor-value" id="val-MQ7">0.0</span>
+                </div>
+                <div class="sensor-item" data-sensor="MQ8">
+                    <div class="sensor-header"><span class="sensor-label">MQ8</span><span class="sensor-type">Hydrogen</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ8"></div></div>
+                    <span class="sensor-value" id="val-MQ8">0.0</span>
+                </div>
+                <div class="sensor-item" data-sensor="MQ135">
+                    <div class="sensor-header"><span class="sensor-label">MQ135</span><span class="sensor-type">Air Quality</span></div>
+                    <div class="sensor-bar-container"><div class="sensor-bar" id="bar-MQ135"></div></div>
+                    <span class="sensor-value" id="val-MQ135">0.0</span>
+                </div>
+            </div>
+            <div class="thermal-display">
+                <h4>Thermal Camera</h4>
+                <div class="thermal-values">
+                    <span>Max: <strong id="thermal-max">--</strong> C</span>
+                    <span>Avg: <strong id="thermal-avg">--</strong> C</span>
+                    <span id="thermal-anomaly" class="thermal-normal">Normal</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="classification-panel">
+            <h3>Hazard Classification</h3>
+            <div class="classification-display">
+                <div class="classification-label" id="class-label">NO_GAS</div>
+                <div class="confidence-display">
+                    <span>Confidence:</span>
+                    <div class="confidence-bar-container"><div class="confidence-bar" id="confidence-bar"></div></div>
+                    <span id="confidence-value">0%</span>
+                </div>
+                <div class="probability-grid">
+                    <div class="prob-item"><span>No Gas</span><div class="prob-bar-container"><div class="prob-bar" id="prob-NO_GAS"></div></div><span class="prob-val" id="probval-NO_GAS">0%</span></div>
+                    <div class="prob-item"><span>Smoke</span><div class="prob-bar-container"><div class="prob-bar prob-smoke" id="prob-SMOKE"></div></div><span class="prob-val" id="probval-SMOKE">0%</span></div>
+                    <div class="prob-item"><span>Perfume</span><div class="prob-bar-container"><div class="prob-bar prob-perfume" id="prob-PERFUME"></div></div><span class="prob-val" id="probval-PERFUME">0%</span></div>
+                    <div class="prob-item"><span>Combined</span><div class="prob-bar-container"><div class="prob-bar prob-combined" id="prob-COMBINED"></div></div><span class="prob-val" id="probval-COMBINED">0%</span></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="escalation-panel">
+            <h3>Escalation Status</h3>
+            <div class="escalation-display">
+                <div class="escalation-tier" id="escalation-tier">NONE</div>
+                <div class="escalation-action" id="escalation-action">Normal operations</div>
+                <div class="escalation-history">
+                    <h4>Recent Escalations</h4>
+                    <div id="escalation-log"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel panel-wide" id="llm-panel">
+            <h3>LLM Analysis (Mistral)</h3>
+            <div class="llm-display">
+                <div class="llm-section">
+                    <h4>Analysis</h4>
+                    <p id="llm-analysis">Waiting for hazard events...</p>
+                </div>
+                <div class="llm-section">
+                    <h4>Recommendation</h4>
+                    <p id="llm-recommendation">--</p>
+                </div>
+                <div class="llm-section">
+                    <h4>Similar Past Incidents (RAG)</h4>
+                    <div id="similar-incidents">No incidents retrieved yet.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="fault-panel">
+            <h3>Fault Tolerance Demo</h3>
+            <p style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">
+                Click a sensor to stop its shard. Akka Cluster Sharding reincarnates it on the next message and
+                Akka Persistence replays the journal — last value comes back automatically.
+            </p>
+            <div class="fault-grid" id="fault-grid"></div>
+        </div>
+
+        <div class="panel" id="chat-panel">
+            <h3>Operator Chat (NL → LLM)</h3>
+            <div class="chat-output" id="chat-output">Ask about the current system state, recent incidents, or recommended actions.</div>
+            <div class="chat-input-row">
+                <input type="text" id="chat-input" placeholder="What's the current hazard level?" />
+                <button id="chat-send">Send</button>
+            </div>
+        </div>
+
+        <div class="panel panel-wide" id="log-panel">
+            <h3>Event Log</h3>
+            <div id="event-log" class="event-log"></div>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
