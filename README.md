@@ -1,4 +1,4 @@
-# Industrial Safety Agent
+# SENSEI: Sensor Safety Engineering Intelligence
 
 An industrial safety monitoring platform that combines simulated gas-sensor streams, thermal analysis, visual inspection events, retrieval-augmented incident history, and an operator dashboard.
 
