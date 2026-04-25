@@ -1,137 +1,221 @@
-# SENSEI — Industrial Safety Monitoring
+# Industrial Safety Agent
 
-CSYE 7374 final project — a multi-agent streaming pipeline that ingests gas-sensor + thermal data, classifies hazards via ONNX, retrieves similar past incidents from Qdrant (RAG), explains them with Mistral, and routes through a tiered escalation policy. Synthesized from two parallel implementations of the same problem statement to satisfy every required constraint.
+An industrial safety monitoring platform that combines simulated gas-sensor streams, thermal analysis, visual inspection events, retrieval-augmented incident history, and an operator dashboard.
 
-## Constraints satisfied
+The backend is a Java 17 Akka Typed system. The frontend is a Next.js dashboard that polls the Akka HTTP server for live telemetry, incidents, chat history, and fault-tolerance state.
 
-| Requirement | How it is met |
-|---|---|
-| Akka messaging pattern | Typed actors, message adapters, AskPattern, Receptionist |
-| Akka sharding | `SensorAgent` is one entity per sensor type (MQ2..MQ135), 7 shards |
-| Database persistence | MongoDB (incident archive) + Akka Persistence journal (sensor events) |
-| AI integration (API based) | Mistral chat (`mistral-small-latest`) + embeddings (`mistral-embed`) |
-| Akka cluster | 3-node cluster (artery 2551/2552/2553) with role-based agent placement |
-| Active persistence | `SensorAgent` is `EventSourcedBehavior`; replay rebuilds rolling state |
-| Communication between actors | Receptionist for cross-node discovery, ServiceKeys, message adapters |
-| Fault tolerance | `SupervisorStrategy.restartWithBackoff`, sharded auto-rehydrate, SBR |
-| Sharded cluster | Cluster Sharding entity proxy on every node, shards keyed by sensor type |
+## What The Project Does
+
+- Replays industrial sensor data from `data/Gas_Sensors_Measurements.csv`.
+- Classifies gas hazards with a PMML model in `src/main/resources/gas_classifier.pmml`.
+- Fuses gas, thermal, and optional audio signals into incident candidates.
+- Uses Mistral for reasoning, report generation, embeddings, and visual analysis.
+- Stores incident history in MongoDB.
+- Stores vector embeddings for incident retrieval in Qdrant.
+- Replays InspecSafe visual inspection events from `inspecsafev1/`.
+- Serves a dashboard, incident reports, chat assistant, and shard-failure demo over HTTP.
+
+## Repository Layout
+
+```text
+.
+|-- src/main/java/com/safety
+|   |-- SafetyGuardian.java          # main entry point and node-role bootstrap
+|   |-- agents/                      # Akka actors for sensing, fusion, reasoning, orchestration
+|   |-- clients/                     # MongoDB, Qdrant, Mistral, email clients
+|   |-- http/                        # Akka HTTP API server
+|   `-- protocol/                    # typed message contracts
+|-- src/main/resources
+|   |-- application.conf             # runtime config and environment overrides
+|   `-- gas_classifier.pmml          # gas classification model
+|-- data/
+|   `-- Gas_Sensors_Measurements.csv # replay source for MQ sensor data
+|-- inspecsafev1/                    # visual inspection dataset
+|-- safety-dashboard/                # Next.js operator UI
+`-- pom.xml                          # Maven build
+```
 
 ## Architecture
 
-```
-Node A (ingestion + fusion)        Node B (reasoning + escalation)     Node C (orchestrator + dashboard)
-  ThermalAgent                       RetrievalAgent (Qdrant)             OrchestratorAgent
-  FusionAgent                        LLMReasoningAgent (Mistral)         SafetyHttpServer (8080)
-  ClassificationAgent (ONNX)         EscalationAgent                     MongoDBService
-  SensorAgent shards (×7)            SensorAgent shards (×7)             SensorAgent shards (×7)
-```
+### Backend pipeline
 
-Sensor sharding runs on every node (proxy-routed). Cross-node discovery is done via the cluster Receptionist with a `ServiceKey` per agent type.
+1. `DataReplayStream` replays CSV rows and feeds Akka Cluster Sharding entities for each MQ sensor.
+2. `SensorAgent` instances normalize readings and forward them to `FusionAgent`.
+3. `ThermalAgent` adds thermal context, including image-based analysis when available.
+4. `FusionAgent` builds a fused event window and sends it to `ClassificationAgent`.
+5. `ClassificationAgent` runs the PMML model and predicts the hazard class.
+6. `LLMReasoningAgent` generates hazard reasoning and recommendations through Mistral.
+7. `EscalationAgent` assigns a tier and forwards the finalized incident to `OrchestratorAgent`.
+8. `OrchestratorAgent` persists incidents to MongoDB and stores retrievable summaries in Qdrant through `RetrievalAgent`.
+9. `SafetyHttpServer` exposes live state and historical data to the dashboard and chat UI.
 
-## Pipeline
+### Visual inspection pipeline
 
-1. `CsvReplaySource` streams `expanded_final_dataset.csv` at 1 row / 2s.
-2. Each row is fanned out to 7 sharded `SensorAgent` entities (event-sourced) and to the `FusionAgent`.
-3. `ThermalAgent` produces a synthetic per-tick frame.
-4. `FusionAgent` waits for all 7 sensors + thermal (or a 3-second timer) and emits a `FusedSnapshot`.
-5. `ClassificationAgent` runs ONNX inference (XGBoost), falls back to rule-based on failure.
-6. If `NO_GAS` with high confidence, the orchestrator short-circuits and emits a no-op incident.
-7. Otherwise: `RetrievalAgent` embeds the situation and pulls top-3 similar incidents from Qdrant.
-8. `LLMReasoningAgent` calls Mistral with the snapshot + RAG context, returns `{analysis, recommendation, suggestedTier}`.
-9. `EscalationAgent` applies the safety-first floor: confidence-tier OR LLM tier, whichever is higher.
-10. Finalized `IncidentReport` is broadcast over SSE, persisted to MongoDB, and upserted back into Qdrant (self-improving RAG).
+1. `VisualInspectionAgent` replays waypoint events from `inspecsafev1/`.
+2. `InspectionReceiverActor` delivers inspection events into the main pipeline.
+3. `SafetyHttpServer` stores recent visual events in memory and serves related image, audio, and IR assets.
+4. Grade 1 and Grade 2 inspection events trigger LLM-generated reports and vector storage for future chat retrieval.
 
-## Quick start (single JVM)
+### Deployment modes
 
-```bash
-# 1. Build (Java 21, Maven)
-mvn clean package -DskipTests
+The system can run as either:
 
-# 2. (Optional) start local MongoDB + Qdrant
-docker compose up -d mongodb qdrant
+- `all`: a single-node local setup for development and demos.
+- `node-a`: sensor sharding, thermal analysis, fusion, classification, HTTP server.
+- `node-b`: retrieval, LLM reasoning, escalation.
+- `node-c`: orchestrator, MongoDB persistence, HTTP server.
+- `node-d`: visual inspection replay.
 
-# 3. (Optional) seed Qdrant with example incidents
-export MISTRAL_API_KEY=...   # leave unset to use pseudo-random vectors
-python3 scripts/seed-qdrant.py
+Set the mode with `SAFETY_ROLE`. If unset, the backend defaults to `all`.
 
-# 4. Set integration secrets (all optional — fallbacks used when missing)
-export MISTRAL_API_KEY=...
-export MONGODB_URI="mongodb://localhost:27017"   # or Atlas URI
-export QDRANT_URL="http://localhost:6333"        # or Qdrant Cloud URL
-export QDRANT_API_KEY=...                        # only for Qdrant Cloud
+## Tech Stack
 
-# 5. Run
-./scripts/run-demo.sh
-# Dashboard: http://localhost:8080/dashboard/index.html
-```
+- Java 17
+- Maven
+- Akka Typed, Akka Cluster, Akka HTTP
+- MongoDB
+- Qdrant
+- Mistral APIs
+- Next.js 16
+- React 19
+- Tailwind CSS 4
+- Recharts
 
-## Quick start (3-node cluster)
+## Configuration
 
-```bash
-mvn clean package -DskipTests
-./scripts/start-cluster.sh    # logs in node-{a,b,c}.log
-./scripts/stop-cluster.sh
-```
+Primary runtime configuration lives in [src/main/resources/application.conf](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/src/main/resources/application.conf).
 
-Same env vars apply. For multi-host deploy set `CLUSTER_HOST_A` / `CLUSTER_HOST_BC` so the seed-node URIs resolve correctly.
+The code supports environment-variable overrides for the most important settings:
 
-## HTTP surface
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /events` | Server-sent stream of `IncidentReport` JSON (live dashboard) |
-| `GET /health` | Liveness probe |
-| `GET /api-status` | Counters + Mongo/Reasoning availability |
-| `GET /api-incidents` | Finalized incidents (Mongo primary, in-memory fallback via AskPattern) |
-| `GET /api-report/{id}` | Single incident detail |
-| `POST /api-chat` | NL query → LLMReasoningAgent (`{query, conversationId}`) |
-| `GET /api-fault/status` | Per-shard alive / killed / recovering |
-| `POST /api-fault/kill/{sensorType}` | Stop a sensor shard — sharding rehydrates on next message |
-| `GET /dashboard/*` | Static dashboard files |
-
-## Fault tolerance demo
-
-1. Open the dashboard, watch live incidents.
-2. Click a sensor in the **Fault Tolerance Demo** panel (or `POST /api-fault/kill/MQ2`).
-3. The shard stops immediately. Shard status flips `killed` → `recovering` → `alive` within ~2 seconds.
-4. The next sensor reading triggers Akka Cluster Sharding to reincarnate the entity; Akka Persistence replays the event journal so rolling state is restored.
-5. Incidents continue without operator intervention.
-
-## ML model
-
-Pre-trained ONNX classifier at `src/main/resources/gas_classifier.onnx`. Retrain with:
-
-```bash
-cd ml
-pip install -r requirements.txt
-python preprocess.py
-python train_classifier.py
-python evaluate.py
+```powershell
+$env:SAFETY_ROLE="all"
+$env:AKKA_HOST="127.0.0.1"
+$env:AKKA_PORT="2551"
+$env:MONGODB_URI="mongodb://localhost:27017"
+$env:QDRANT_URL="http://localhost:6333"
+$env:QDRANT_API_KEY=""
+$env:MISTRAL_API_KEY="your-key"
+$env:INSPECSAFE_DATA_PATH=".\inspecsafev1"
 ```
 
-Output is XGBoost → ONNX 4-class softmax over `{NO_GAS, SMOKE, PERFUME, COMBINED}`.
+Important config groups:
 
-## Project layout
+- `safety.http`: backend host and port, default `0.0.0.0:8080`
+- `safety.mongodb`: incident persistence
+- `safety.qdrant`: vector search storage
+- `safety.mistral`: chat, reasoning, vision, and embedding models
+- `safety.data`: CSV replay source and interval
+- `safety.inspecsafe`: visual dataset path and replay interval
+- `safety.model`: PMML model path
+- `safety.email`: SMTP settings for escalation notifications
 
+## Security Note
+
+`application.conf` currently contains concrete service credentials and email settings in the checked-in file. For shared or production use, move those values into environment variables or a non-committed secrets file and rotate any exposed keys.
+
+## Prerequisites
+
+- Java 17+
+- Maven 3.9+
+- Node.js 20+
+- npm
+- Access to MongoDB
+- Access to Qdrant
+- Access to Mistral APIs
+
+## Running The Project
+
+### 1. Start the backend
+
+From the repository root:
+
+```powershell
+mvn compile
+mvn exec:java
 ```
-SENSEI/
-├── pom.xml                    # Maven (Java 21, Akka 2.8.6, akka-http 10.5.3)
-├── docker-compose.yml         # MongoDB + Qdrant local
-├── scripts/                   # start/stop cluster, seed Qdrant, run-demo
-├── ml/                        # XGBoost training pipeline + ONNX export
-├── dashboard/                 # Vanilla HTML/CSS/JS, SSE client + chat + fault demo
-└── src/main/
-    ├── java/edu/neu/safety/
-    │   ├── Main.java
-    │   ├── model/             # CborSerializable records (over-the-wire types)
-    │   ├── agents/            # 8 typed actors with their protocols
-    │   ├── cluster/           # ClusterSetup, ClusterRoles, AgentServiceKeys
-    │   ├── inference/         # ONNX classifier + feature extractor
-    │   ├── external/          # MistralClient, QdrantService, MongoDBService
-    │   ├── replay/            # CSV + thermal frame loaders
-    │   └── http/              # SafetyHttpServer (SSE + REST)
-    └── resources/
-        ├── application.conf, single-jvm.conf, node-{a,b,c}.conf
-        ├── logback.xml
-        └── gas_classifier.onnx
+
+The backend starts `com.safety.SafetyGuardian` and serves HTTP on `http://localhost:8080` by default.
+
+### 2. Start the dashboard
+
+From [safety-dashboard](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/safety-dashboard):
+
+```powershell
+npm install
+npm run dev
 ```
+
+The dashboard runs on `http://localhost:3000`.
+
+### 3. Open the UI
+
+- Dashboard: `http://localhost:3000`
+- Backend API: `http://localhost:8080`
+
+## Building
+
+### Backend jar
+
+```powershell
+mvn package -DskipTests
+java -jar target/safety-agent.jar
+```
+
+### Frontend production build
+
+```powershell
+cd safety-dashboard
+npm run build
+npm run start
+```
+
+## HTTP API Overview
+
+The backend HTTP surface is implemented in [src/main/java/com/safety/http/SafetyHttpServer.java](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/src/main/java/com/safety/http/SafetyHttpServer.java).
+
+Core endpoints:
+
+- `GET /health`: basic health check
+- `GET /api-events`: combined dashboard payload with latest sensor, thermal, status, history, escalations, and inspection events
+- `GET /api-sensors`: recent sensor events
+- `GET /api-sensor-history`: rolling sensor history for charts
+- `GET /api-escalations`: recent T2/T3 escalation feed
+- `GET /api-thermal`: current thermal state and active frame metadata
+- `POST /api-thermal/analyze`: submit a thermal image for analysis
+- `GET /api-status`: aggregate system status
+- `GET /api-incidents`: incident list
+- `GET /api-report/{incidentId}`: full incident report
+- `GET /api-chat/conversations`: saved chat sessions
+- `GET /api-chat/history/{conversationId}`: prior messages for a session
+- `POST /api-chat`: grounded operator chat query
+- `GET /api-inspection/events`: recent visual inspection events
+- `GET /api-inspection/image/{path}`: inspection image asset
+- `GET /api-inspection/audio/{path}`: inspection audio asset
+- `GET /api-inspection/video/{path}`: inspection IR video asset
+- `GET /api-fault/status`: shard fault-demo state
+- `POST /api-fault/kill/{sensorType}`: intentionally stop a sensor shard
+
+## Frontend Pages
+
+The Next.js app in [safety-dashboard](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/safety-dashboard) provides:
+
+- `/`: real-time dashboard for gas, thermal, and visual monitoring
+- `/incidents`: incident log and generated reports
+- `/chat`: grounded chat assistant over live state and past incidents
+- `/fault`: Akka shard failure and recovery demonstration
+
+## Fault Tolerance
+
+The project includes an explicit Akka fault-tolerance demo:
+
+- Sensor entities are sharded by MQ sensor type.
+- `POST /api-fault/kill/{sensorType}` stops a shard entity on purpose.
+- Akka Cluster Sharding recreates the entity on the next message.
+- The dashboard shows `killed`, `recovering`, and `alive` transitions.
+
+## Development Notes
+
+- The frontend assumes the backend is reachable at `http://localhost:8080`.
+- The backend uses in-memory rolling buffers for live events and external stores for persistence/retrieval.
+- Qdrant failures degrade gracefully by disabling RAG until the next successful reconnect.
+- `dependency-reduced-pom.xml` is generated by the shade plugin during packaging.
