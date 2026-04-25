@@ -56,17 +56,6 @@ Examples of parameter files present locally:
 - `LiDAR_params.json`
 - `RGB_Camera_params.json`
 
-## How The Project Uses It
-
-The visual pipeline uses this folder as the dataset root configured by:
-
-- [application.conf](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/src/main/resources/application.conf:75)
-
-Relevant runtime code:
-
-- [SafetyGuardian.java](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/src/main/java/com/safety/SafetyGuardian.java:217)
-- [VisualInspectionAgent.java](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/src/main/java/com/safety/agents/VisualInspectionAgent.java:21)
-- [SafetyHttpServer.java](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/src/main/java/com/safety/http/SafetyHttpServer.java:773)
 
 At runtime, `VisualInspectionAgent`:
 
