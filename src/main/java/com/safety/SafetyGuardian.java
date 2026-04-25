@@ -27,23 +27,6 @@ import com.typesafe.config.Config;
 
 import java.util.Set;
 
-/**
- * SafetyGuardian — root supervisor.
- *
- * Roles (safety.node-role / SAFETY_ROLE env var):
- *   "all"    — single-node, spawn everything (default for mvn exec:java)
- *   "node-a" — SensorSharding + ThermalAgent + FusionAgent + ClassificationAgent + HTTP + Replay
- *              + InspectionReceiverActor (registered with Receptionist for node-d)
- *   "node-b" — RetrievalAgent + LLMReasoningAgent + EscalationAgent  (registered with Receptionist)
- *   "node-c" — OrchestratorAgent  (registered with Receptionist)
- *   "node-d" — VisualInspectionAgent  (discovers node-a's InspectionReceiverActor via Receptionist)
- *
- * Cross-node wiring uses Akka Cluster Receptionist:
- *   node-a subscribes to listings for node-b actors and node-c actors.
- *   node-a registers InspectionReceiverActor for node-d to discover.
- *   node-b subscribes to node-c's OrchestratorAgent listing.
- *   node-d subscribes to node-a's InspectionReceiverActor listing.
- */
 public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
 
     // ---- Service keys for Receptionist ----
@@ -69,35 +52,28 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
     private record GotOutputRefs(OutputSupervisor.Refs refs) implements Command {}
     private record GotSensingRefs(SensingSupervisor.Refs refs) implements Command {}
 
-    // Receptionist listing wrappers
-    private record RetrievalListing(Receptionist.Listing listing) implements Command {}
-    private record LLMListing(Receptionist.Listing listing) implements Command {}
-    private record EscalationListing(Receptionist.Listing listing) implements Command {}
-    private record OrchestratorListing(Receptionist.Listing listing) implements Command {}
+    // Single wrapper for all Receptionist listings — Akka only supports one adapter per type
+    private record AnyListing(Receptionist.Listing listing) implements Command {}
     private record InspectionReceiverListing(Receptionist.Listing listing) implements Command {}
 
     // ---- State ----
     private boolean started = false;
 
-    // node-a pending state: FusionAgent waits for node-b refs before it can be wired fully
-    // We store the node-b refs as they arrive from Receptionist and re-wire FusionAgent
+    
     private ActorRef<FusionAgent.Command> fusionAgentRef;
     private ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgentRef;
 
-    // Remote refs discovered via Receptionist
     private ActorRef<RetrievalAgent.Command> remoteRetrievalAgent;
     private ActorRef<LLMProtocol.Command> remoteLlmAgent;
     private ActorRef<EscalationProtocol.EscalationRequest> remoteEscalationAgent;
     private ActorRef<OrchestratorAgent.Command> remoteOrchestratorAgent;
 
-    // For node-b: EscalationAgent needs orchestrator ref (arrives from Receptionist)
     private ActorRef<EscalationProtocol.EscalationRequest> localEscalationAgent;
     private ActorRef<OrchestratorProtocol.IncidentFinalized> orchestratorIncidentAdapter;
 
-    // For node-d: VisualInspectionAgent receives the InspectionReceiverActor ref from Receptionist
     private ActorRef<VisualInspectionAgent.Command> localVisualInspectionAgent;
 
-    // For HTTP server (node-a or node-c)
+    // For HTTP server
     private SafetyHttpServer httpServer;
 
     // Hold partial state between all-in-one startup phases
@@ -126,10 +102,7 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
             .onMessage(GotReasoningRefs.class, this::onGotReasoningRefs)
             .onMessage(GotOutputRefs.class, this::onGotOutputRefs)
             .onMessage(GotSensingRefs.class, this::onGotSensingRefs)
-            .onMessage(RetrievalListing.class, this::onRetrievalListing)
-            .onMessage(LLMListing.class, this::onLLMListing)
-            .onMessage(EscalationListing.class, this::onEscalationListing)
-            .onMessage(OrchestratorListing.class, this::onOrchestratorListing)
+            .onMessage(AnyListing.class, this::onAnyListing)
             .onMessage(InspectionReceiverListing.class, this::onInspectionReceiverListing)
             .build();
     }
@@ -138,9 +111,6 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         return this;
     }
 
-    // ======================================================================
-    //  MAIN START LOGIC
-    // ======================================================================
 
     private Behavior<Command> onStartSystem(StartSystem cmd) {
         if (started) return this;
@@ -163,9 +133,6 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         return this;
     }
 
-    // ======================================================================
-    //  ROLE: all — single-node (existing behaviour, backward-compatible)
-    // ======================================================================
 
     private void startAllInOne(Config safetyConfig) {
         getContext().getLog().info("Starting in ALL-IN-ONE mode (single node)");
@@ -267,14 +234,11 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         );
         replay.startReplay();
 
-        // Spawn InspectionReceiverActor first — same JVM so no Receptionist needed.
-        // In all-in-one mode it's wired directly; in node-d mode it's discovered via Receptionist.
         ActorRef<InspectionProtocol.ReceiverCommand> inspectionReceiver = getContext().spawn(
             InspectionReceiverActor.create(), "inspection-receiver"
         );
 
-        // Spawn VisualInspectionAgent and immediately give it the local receiver ref
-        // so it routes events through the actor even in single-node mode.
+   
         ActorRef<VisualInspectionAgent.Command> visualAgent = getContext().spawn(
             VisualInspectionAgent.create(inspecsafeRoot, inspecsafeInterval),
             "visual-inspection-agent"
@@ -285,44 +249,25 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         return this;
     }
 
-    // ======================================================================
-    //  ROLE: node-a — sensors + thermal + fusion + classification + HTTP + replay
-    // ======================================================================
 
     private void startNodeA(Config safetyConfig) {
         getContext().getLog().info("Starting NODE-A: SensorSharding + Thermal + Fusion + Classification + HTTP");
 
         MistralClient mistral = buildMistral(safetyConfig);
 
-        // ClassificationAgent needs RetrievalAgent ref — will arrive from Receptionist.
-        // Spawn classification with a placeholder; we'll send UpdateRetrievalRef when ready.
-        // For now we build a dummy retrieval adapter that logs and drops — real one arrives soon.
-        // Actually ClassificationAgent doesn't accept ref updates after creation, so we defer
-        // spawning classification + fusion until we have the node-b refs, OR we wire them
-        // with mutable ref holders. The cleanest approach: subscribe to Receptionist first,
-        // and spawn fusion/classification once we get at least the retrieval ref.
-        // For simplicity: spawn everything immediately with null-safe adapters, then
-        // FusionAgent's internal routing will silently drop until remote agents appear.
-        // We pass placeholder refs that the guardian swaps out via SetFusionRef-style messages.
-
-        // Subscribe to node-b actors first
-        ActorRef<Receptionist.Listing> retrievalAdapter =
-            getContext().messageAdapter(Receptionist.Listing.class, RetrievalListing::new);
-        ActorRef<Receptionist.Listing> llmAdapter =
-            getContext().messageAdapter(Receptionist.Listing.class, LLMListing::new);
-        ActorRef<Receptionist.Listing> escalationAdapter =
-            getContext().messageAdapter(Receptionist.Listing.class, EscalationListing::new);
-        ActorRef<Receptionist.Listing> orchestratorAdapter =
-            getContext().messageAdapter(Receptionist.Listing.class, OrchestratorListing::new);
+    
+        // One adapter for all remote service listings — Akka only allows one adapter per source type
+        ActorRef<Receptionist.Listing> anyAdapter =
+            getContext().messageAdapter(Receptionist.Listing.class, AnyListing::new);
 
         getContext().getSystem().receptionist().tell(
-            Receptionist.subscribe(RETRIEVAL_KEY, retrievalAdapter));
+            Receptionist.subscribe(RETRIEVAL_KEY, anyAdapter));
         getContext().getSystem().receptionist().tell(
-            Receptionist.subscribe(LLM_KEY, llmAdapter));
+            Receptionist.subscribe(LLM_KEY, anyAdapter));
         getContext().getSystem().receptionist().tell(
-            Receptionist.subscribe(ESCALATION_KEY, escalationAdapter));
+            Receptionist.subscribe(ESCALATION_KEY, anyAdapter));
         getContext().getSystem().receptionist().tell(
-            Receptionist.subscribe(ORCHESTRATOR_KEY, orchestratorAdapter));
+            Receptionist.subscribe(ORCHESTRATOR_KEY, anyAdapter));
 
         // Thermal
         ActorRef<ThermalAgent.Command> thermalAgent =
@@ -344,10 +289,7 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         http.start(safetyConfig.getString("http.host"), safetyConfig.getInt("http.port"));
         this.httpServer = http;
 
-        // Store thermalAgent ref so Receptionist callbacks can wire FusionAgent later
-        // We store it in a field and spawn ClassificationAgent + FusionAgent
-        // with dead-letter stubs for the remote refs. Real refs arrive from Receptionist.
-
+        
         // Spawn ClassificationAgent with a dead-letter retrieval stub
         ActorRef<RetrievalAgent.Command> deadRetrievalStub =
             getContext().getSystem().deadLetters();
@@ -376,7 +318,6 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         thermalAgent.tell(new ThermalAgent.SetFusionRef(fusionAgent));
 
         // Data replay: starts but thermal images will flow; sensor events will flow;
-        // classification/fusion will use dead-letter stubs until node-b connects.
         DataReplayStream replay = new DataReplayStream(
             getContext().getSystem(), sharding,
             safetyConfig.getString("data.csv-path"),
@@ -399,10 +340,7 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         getContext().getLog().info("NODE-A ready. InspectionReceiverActor registered. Waiting for node-b/node-c/node-d Receptionist listings...");
     }
 
-    // ======================================================================
-    //  ROLE: node-b — retrieval + LLM + escalation
-    // ======================================================================
-
+  
     private void startNodeB(Config safetyConfig) {
         getContext().getLog().info("Starting NODE-B: RetrievalAgent + LLMReasoningAgent + EscalationAgent");
 
@@ -411,10 +349,10 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         MongoDBService mongo  = buildMongo(safetyConfig);
 
         // Subscribe to node-c OrchestratorAgent listing so EscalationAgent can forward incidents
-        ActorRef<Receptionist.Listing> orchestratorAdapter =
-            getContext().messageAdapter(Receptionist.Listing.class, OrchestratorListing::new);
+        ActorRef<Receptionist.Listing> anyAdapter =
+            getContext().messageAdapter(Receptionist.Listing.class, AnyListing::new);
         getContext().getSystem().receptionist().tell(
-            Receptionist.subscribe(ORCHESTRATOR_KEY, orchestratorAdapter));
+            Receptionist.subscribe(ORCHESTRATOR_KEY, anyAdapter));
 
         // Retrieval
         ActorRef<RetrievalAgent.Command> retrievalAgent =
@@ -425,9 +363,6 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
             getContext().spawn(LLMReasoningAgent.create(mistral, mongo, retrievalAgent), "llm-reasoning-agent");
 
         // EscalationAgent: orchestrator ref arrives from Receptionist.
-        // Build an adapter that will route IncidentFinalized to remoteOrchestratorAgent once set.
-        // We create EscalationAgent with a dead-letter stub and replace via re-spawn or
-        // by routing through SafetyGuardian itself as the forwarder.
         ActorRef<OrchestratorProtocol.IncidentFinalized> orchestratorForwarder =
             getContext().messageAdapter(
                 OrchestratorProtocol.IncidentFinalized.class,
@@ -459,35 +394,26 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         getContext().getLog().info("NODE-B ready. Registered retrieval/llm/escalation with Receptionist.");
     }
 
-    // ======================================================================
-    //  ROLE: node-c — orchestrator (+ optional HTTP)
-    // ======================================================================
-
     private void startNodeC(Config safetyConfig) {
         getContext().getLog().info("Starting NODE-C: OrchestratorAgent");
 
         MongoDBService mongo = buildMongo(safetyConfig);
 
         // OrchestratorAgent needs a RetrievalAgent for Qdrant storage.
-        // On node-c, subscribe to node-b's retrieval listing.
-        ActorRef<Receptionist.Listing> retrievalAdapter =
-            getContext().messageAdapter(Receptionist.Listing.class, RetrievalListing::new);
+        ActorRef<Receptionist.Listing> anyAdapter =
+            getContext().messageAdapter(Receptionist.Listing.class, AnyListing::new);
         getContext().getSystem().receptionist().tell(
-            Receptionist.subscribe(RETRIEVAL_KEY, retrievalAdapter));
+            Receptionist.subscribe(RETRIEVAL_KEY, anyAdapter));
 
-        // We'll spawn OrchestratorAgent when the retrieval ref arrives.
-        // For now, keep a dead-letter stub and re-wire once listing comes in.
         ActorRef<RetrievalAgent.Command> deadRetrievalStub =
             getContext().getSystem().deadLetters();
 
         ActorRef<OrchestratorAgent.Command> orchestratorAgent =
             getContext().spawn(OrchestratorAgent.create(deadRetrievalStub, mongo), "orchestrator-agent");
 
-        // Register with Receptionist
         getContext().getSystem().receptionist().tell(
             Receptionist.register(ORCHESTRATOR_KEY, orchestratorAgent));
 
-        // HTTP on node-c so operators can query incidents
         SafetyHttpServer http = new SafetyHttpServer(getContext().getSystem());
         http.setOrchestratorAgent(orchestratorAgent);
         http.setMongo(mongo);
@@ -496,10 +422,6 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
 
         getContext().getLog().info("NODE-C ready. OrchestratorAgent registered with Receptionist.");
     }
-
-    // ======================================================================
-    //  ROLE: node-d — VisualInspectionAgent (discovers node-a's receiver via Receptionist)
-    // ======================================================================
 
     private void startNodeD(Config safetyConfig) {
         getContext().getLog().info("Starting NODE-D: VisualInspectionAgent");
@@ -511,15 +433,13 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
             ? safetyConfig.getLong("inspecsafe.replay-interval-ms")
             : 20000L;
 
-        // Spawn VisualInspectionAgent — it will start ticking but events will be
-        // buffered/dropped until we give it the InspectionReceiverActor ref from node-a.
+        
         localVisualInspectionAgent = getContext().spawn(
             VisualInspectionAgent.create(inspecsafeRoot, inspecsafeInterval),
             "visual-inspection-agent"
         );
 
-        // Subscribe to INSPECTION_RECEIVER_KEY so we're notified when node-a's receiver
-        // registers (or if it re-registers after a crash restart).
+ 
         ActorRef<Receptionist.Listing> receiverAdapter =
             getContext().messageAdapter(Receptionist.Listing.class, InspectionReceiverListing::new);
         getContext().getSystem().receptionist().tell(
@@ -529,65 +449,50 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
             "NODE-D ready. VisualInspectionAgent started, waiting for InspectionReceiverActor on node-a...");
     }
 
-    // ======================================================================
-    //  RECEPTIONIST LISTING HANDLERS
-    // ======================================================================
+    // Single handler dispatches all remote service listings by key — avoids the one-adapter-per-type limit
+    private Behavior<Command> onAnyListing(AnyListing msg) {
+        Receptionist.Listing listing = msg.listing();
 
-    private Behavior<Command> onRetrievalListing(RetrievalListing msg) {
-        Set<ActorRef<RetrievalAgent.Command>> instances =
-            msg.listing().getServiceInstances(RETRIEVAL_KEY);
-        if (!instances.isEmpty()) {
-            remoteRetrievalAgent = instances.iterator().next();
-            getContext().getLog().info("Receptionist: RetrievalAgent discovered at {}",
-                remoteRetrievalAgent.path());
+        if (listing.isForKey(RETRIEVAL_KEY)) {
+            Set<ActorRef<RetrievalAgent.Command>> instances = listing.getServiceInstances(RETRIEVAL_KEY);
+            if (!instances.isEmpty()) {
+                remoteRetrievalAgent = instances.iterator().next();
+                getContext().getLog().info("Receptionist: RetrievalAgent discovered at {}", remoteRetrievalAgent.path());
+                if (httpServer != null) {
+                    if (remoteLlmAgent != null) httpServer.setLlmAgent(remoteLlmAgent);
+                    httpServer.setRetrievalAgent(remoteRetrievalAgent);
+                }
+            }
 
-            // Wire HTTP server
-            if (httpServer != null) {
-                if (remoteLlmAgent != null) httpServer.setLlmAgent(remoteLlmAgent);
-                httpServer.setRetrievalAgent(remoteRetrievalAgent);
+        } else if (listing.isForKey(LLM_KEY)) {
+            Set<ActorRef<LLMProtocol.Command>> instances = listing.getServiceInstances(LLM_KEY);
+            if (!instances.isEmpty()) {
+                remoteLlmAgent = instances.iterator().next();
+                getContext().getLog().info("Receptionist: LLMReasoningAgent discovered at {}", remoteLlmAgent.path());
+                if (httpServer != null) httpServer.setLlmAgent(remoteLlmAgent);
+            }
+
+        } else if (listing.isForKey(ESCALATION_KEY)) {
+            Set<ActorRef<EscalationProtocol.EscalationRequest>> instances = listing.getServiceInstances(ESCALATION_KEY);
+            if (!instances.isEmpty()) {
+                remoteEscalationAgent = instances.iterator().next();
+                getContext().getLog().info("Receptionist: EscalationAgent discovered at {}", remoteEscalationAgent.path());
+                // Wire FusionAgent with real Node B refs as soon as all three are available
+                if (fusionAgentRef != null && remoteRetrievalAgent != null && remoteLlmAgent != null) {
+                    fusionAgentRef.tell(new FusionAgent.UpdateRefs(
+                        remoteRetrievalAgent, remoteLlmAgent, remoteEscalationAgent));
+                }
+            }
+
+        } else if (listing.isForKey(ORCHESTRATOR_KEY)) {
+            Set<ActorRef<OrchestratorAgent.Command>> instances = listing.getServiceInstances(ORCHESTRATOR_KEY);
+            if (!instances.isEmpty()) {
+                remoteOrchestratorAgent = instances.iterator().next();
+                getContext().getLog().info("Receptionist: OrchestratorAgent discovered at {}", remoteOrchestratorAgent.path());
+                if (httpServer != null) httpServer.setOrchestratorAgent(remoteOrchestratorAgent);
             }
         }
-        return this;
-    }
 
-    private Behavior<Command> onLLMListing(LLMListing msg) {
-        Set<ActorRef<LLMProtocol.Command>> instances =
-            msg.listing().getServiceInstances(LLM_KEY);
-        if (!instances.isEmpty()) {
-            remoteLlmAgent = instances.iterator().next();
-            getContext().getLog().info("Receptionist: LLMReasoningAgent discovered at {}",
-                remoteLlmAgent.path());
-            // Wire HTTP if present
-            if (httpServer != null) {
-                httpServer.setLlmAgent(remoteLlmAgent);
-            }
-        }
-        return this;
-    }
-
-    private Behavior<Command> onEscalationListing(EscalationListing msg) {
-        Set<ActorRef<EscalationProtocol.EscalationRequest>> instances =
-            msg.listing().getServiceInstances(ESCALATION_KEY);
-        if (!instances.isEmpty()) {
-            remoteEscalationAgent = instances.iterator().next();
-            getContext().getLog().info("Receptionist: EscalationAgent discovered at {}",
-                remoteEscalationAgent.path());
-        }
-        return this;
-    }
-
-    private Behavior<Command> onOrchestratorListing(OrchestratorListing msg) {
-        Set<ActorRef<OrchestratorAgent.Command>> instances =
-            msg.listing().getServiceInstances(ORCHESTRATOR_KEY);
-        if (!instances.isEmpty()) {
-            remoteOrchestratorAgent = instances.iterator().next();
-            getContext().getLog().info("Receptionist: OrchestratorAgent discovered at {}",
-                remoteOrchestratorAgent.path());
-            // Wire HTTP server if present (node-a or node-c)
-            if (httpServer != null) {
-                httpServer.setOrchestratorAgent(remoteOrchestratorAgent);
-            }
-        }
         return this;
     }
 
@@ -609,10 +514,6 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         }
         return this;
     }
-
-    // ======================================================================
-    //  CLIENT BUILDERS
-    // ======================================================================
 
     private MistralClient buildMistral(Config c) {
         return new MistralClient(
@@ -653,10 +554,7 @@ public class SafetyGuardian extends AbstractBehavior<SafetyGuardian.Command> {
         );
     }
 
-    // ======================================================================
-    //  MAIN ENTRY POINT
-    // ======================================================================
-
+   
     public static void main(String[] args) {
         ActorSystem<Command> system = ActorSystem.create(
             SafetyGuardian.create(),

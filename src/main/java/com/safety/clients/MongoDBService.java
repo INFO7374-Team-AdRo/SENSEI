@@ -75,10 +75,7 @@ public class MongoDBService {
         }
     }
 
-    /**
-     * Saves a Grade-1 or Grade-2 InspecSafe visual inspection event as an incident.
-     * The document contains a "source":"inspecsafe" field so the UI can render it differently.
-     */
+ 
     public void saveInspectionIncident(Map<String, Object> eventMap) {
         if (!available) return;
         try {
@@ -163,10 +160,7 @@ public class MongoDBService {
         }
     }
 
-    /**
-     * Returns up to {@code limit} most-recent turns for a conversation, oldest-first,
-     * as a list of {"role": "user"/"assistant", "content": "..."} maps for the Mistral API.
-     */
+    
     public List<Map<String, String>> loadChatHistory(String conversationId, int limit) {
         if (!available) return new ArrayList<>();
         List<Map<String, String>> result = new ArrayList<>();
@@ -186,9 +180,7 @@ public class MongoDBService {
         return result;
     }
 
-    /**
-     * Returns raw chat turns for a conversation (includes timestamp) for the history API endpoint.
-     */
+ 
     public List<Map<String, Object>> getChatHistory(String conversationId, int limit) {
         if (!available) return new ArrayList<>();
         List<Map<String, Object>> result = new ArrayList<>();
@@ -209,10 +201,7 @@ public class MongoDBService {
         return result;
     }
 
-    /**
-     * Returns the most-recent conversations (up to {@code limit}), newest-first.
-     * Each entry has: conversationId, title (first user message, truncated), lastActivity (ISO string).
-     */
+ 
     public List<Map<String, Object>> listConversations(int limit) {
         if (!available) return new ArrayList<>();
         List<Map<String, Object>> result = new ArrayList<>();

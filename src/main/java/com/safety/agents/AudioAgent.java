@@ -13,18 +13,7 @@ import java.io.File;
 import java.time.Instant;
 
 /**
- * AudioAgent — InspecSafe-V1 modality extension.
- *
- * Processes .wav files from inspection robots. Computes:
- *   - RMS energy (normalized)
- *   - Dominant frequency band via simple zero-crossing rate approximation
- *   - Anomaly detection (high energy spike or unusual frequency)
- *
- * Sends AudioEvent to FusionAgent on every processed frame.
- * Falls back gracefully if no audio file is provided (simulation from context).
- *
- * Supervised by SensingSupervisor with restartWithBackoff — audio I/O failures
- * crash this actor cleanly so the supervisor can restart it.
+ * AudioAgent
  */
 public class AudioAgent extends AbstractBehavior<AudioAgent.Command> {
 
@@ -39,7 +28,7 @@ public class AudioAgent extends AbstractBehavior<AudioAgent.Command> {
 
     // Anomaly thresholds (tunable via config in future)
     private static final double ENERGY_ANOMALY_THRESHOLD = 0.65;
-    private static final double FREQ_ANOMALY_MIN_HZ      = 2000.0; // alarm-range
+    private static final double FREQ_ANOMALY_MIN_HZ      = 2000.0;
     private static final int    SAMPLE_WINDOW_BYTES      = 8192;
 
     private ActorRef<FusionAgent.Command> fusionAgent;
@@ -69,7 +58,7 @@ public class AudioAgent extends AbstractBehavior<AudioAgent.Command> {
         return this;
     }
 
-    // ---- Real WAV processing (InspecSafe-V1 audio files) ----
+    // WAV processing
     private Behavior<Command> onProcessAudio(ProcessAudio msg) {
         if (fusionAgent == null) return this;
 

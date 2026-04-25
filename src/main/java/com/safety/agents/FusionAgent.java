@@ -21,6 +21,12 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
     public record ThermalUpdate(ThermalProtocol.ThermalEvent event) implements Command {}
     public record AudioUpdate(AudioProtocol.AudioEvent event) implements Command {}
     private record FlushWindow() implements Command {}
+    // sent by SafetyGuardian once Receptionist discovers remote agents on Node B
+    public record UpdateRefs(
+        ActorRef<RetrievalAgent.Command> retrievalAgent,
+        ActorRef<LLMProtocol.Command> llmAgent,
+        ActorRef<EscalationProtocol.EscalationRequest> escalationAgent
+    ) implements Command {}
 
     private static final Duration WINDOW_DURATION = Duration.ofSeconds(5);
 
@@ -39,10 +45,10 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
     private final ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent;
     private final ActorRef<ClassificationProtocol.ClassificationResult> classificationResultAdapter;
 
-    // Next hop after classification
-    private final ActorRef<RetrievalAgent.Command> retrievalAgent;
-    private final ActorRef<LLMProtocol.Command> llmAgent;
-    private final ActorRef<EscalationProtocol.EscalationRequest> escalationAgent;
+    // Next hop after classification — mutable so Receptionist discovery can wire real Node B refs
+    private ActorRef<RetrievalAgent.Command> retrievalAgent;
+    private ActorRef<LLMProtocol.Command> llmAgent;
+    private ActorRef<EscalationProtocol.EscalationRequest> escalationAgent;
 
     public static Behavior<Command> create(
             ActorRef<ClassificationProtocol.ClassifyRequest> classificationAgent,
@@ -99,6 +105,7 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
             .onMessage(ClassificationResultReceived.class, this::onClassificationResult)
             .onMessage(RetrievalResultReceived.class, this::onRetrievalResult)
             .onMessage(ReasoningResultReceived.class, this::onReasoningResult)
+            .onMessage(UpdateRefs.class, this::onUpdateRefs)
             .build();
     }
 
@@ -130,6 +137,14 @@ public class FusionAgent extends AbstractBehavior<FusionAgent.Command> {
 
     private Behavior<Command> onFlush(FlushWindow msg) {
         if (!currentSensorEvents.isEmpty()) emitFusedEvent();
+        return this;
+    }
+
+    private Behavior<Command> onUpdateRefs(UpdateRefs msg) {
+        this.retrievalAgent  = msg.retrievalAgent();
+        this.llmAgent        = msg.llmAgent();
+        this.escalationAgent = msg.escalationAgent();
+        getContext().getLog().info("FusionAgent: remote refs updated — escalation/llm/retrieval now wired to Node B");
         return this;
     }
 

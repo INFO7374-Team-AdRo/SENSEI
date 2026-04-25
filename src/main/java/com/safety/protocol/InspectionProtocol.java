@@ -1,6 +1,7 @@
 package com.safety.protocol;
 
 import akka.actor.typed.ActorRef;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import java.time.Instant;
 
 /**
@@ -89,5 +90,5 @@ public class InspectionProtocol {
 
     // ── InspectionReceiverActor command — carries event across the cluster wire
     public interface ReceiverCommand extends CborSerializable {}
-    public record ForwardInspectionEvent(InspectionEvent event) implements ReceiverCommand {}
+    public record ForwardInspectionEvent(@JsonProperty("event") InspectionEvent event) implements ReceiverCommand {}
 }

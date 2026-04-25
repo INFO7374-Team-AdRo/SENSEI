@@ -15,21 +15,17 @@ import java.util.Deque;
 
 public class SensorAgent extends AbstractBehavior<SensorAgent.Command> {
 
-    // Sharding entity key
     public static final EntityTypeKey<Command> ENTITY_KEY =
         EntityTypeKey.create(Command.class, "SensorAgent");
 
-    // Commands
     public interface Command {}
 
     public record ProcessReading(
         String sensorType, int valuePpm, Instant timestamp
     ) implements Command {}
 
-    // Tells this shard where to send processed events
     public record SetFusionRef(ActorRef<FusionAgent.Command> fusionAgent) implements Command {}
 
-    // Fault tolerance demo: gracefully stops this shard entity
     public record Stop() implements Command {}
 
     // Rolling window
@@ -119,21 +115,15 @@ public class SensorAgent extends AbstractBehavior<SensorAgent.Command> {
         return "stable";
     }
 
-    /**
-     * Low-side ADC thresholds calibrated from Gas_Sensors_Measurements.csv.
-     * These sensors output LOWER ADC when gas concentration rises.
-     * NoGas baselines: MQ2≈748, MQ3≈529, MQ5≈431, MQ6≈425, MQ7≈606, MQ8≈637, MQ135≈474
-     * Threshold = baseline minus ~15% safety margin (flags meaningful gas presence).
-     */
+    
     private static int getThreshold(String sensorType) {
         return switch (sensorType) {
-            case "MQ2"   -> 690;  // NoGas≈748; Smoke drops to ~623, Mixture ~593
-            case "MQ3"   -> 490;  // NoGas≈529; gas drops to ~372–419
-            case "MQ5"   -> 400;  // NoGas≈431; gas drops to ~340–407
-            case "MQ6"   -> 400;  // NoGas≈425; gas drops to ~368–376
-            case "MQ7"   -> 560;  // NoGas≈606; Mixture drops to ~460
-            case "MQ8"   -> 580;  // NoGas≈637; Mixture drops sharply to ~315
-            case "MQ135" -> 430;  // NoGas≈474; Smoke drops to ~308
+            case "MQ3"   -> 490;  
+            case "MQ5"   -> 400;  
+            case "MQ6"   -> 400; 
+            case "MQ7"   -> 560;  
+            case "MQ8"   -> 580;  
+            case "MQ135" -> 430;              
             default      -> 400;
         };
     }
