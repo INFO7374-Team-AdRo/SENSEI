@@ -25,6 +25,22 @@ This project uses the following assets from that dataset:
 - [Gas_Sensors_Measurements.csv](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/data/Gas_Sensors_Measurements.csv)
 - [Thermal Camera Images](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/data/Thermal%20Camera%20Images)
 
+## Project Structure
+
+Expected local structure:
+
+```text
+industrial-safety-agent/
+`-- data/
+    |-- Gas_Sensors_Measurements.csv
+    `-- Thermal Camera Images/
+        |-- Mixture/
+        |-- NoGas/
+        |-- Perfume/
+        |-- Smoke/
+        `-- Sample Thermal Camera Images/
+```
+
 The thermal image folder currently contains class-based subfolders such as:
 
 - `Mixture`
@@ -50,8 +66,33 @@ At runtime:
 
 - `DataReplayStream` replays `Gas_Sensors_Measurements.csv`
 - the MQ sensor values are sent into the Akka sensor/fusion/classification pipeline
-- thermal images are served/analyzed from `data/Thermal Camera Images`
-- the gas classifier maps replayed readings into the project’s hazard classes shown in the dashboard
+- thermal images are served and analyzed from `data/Thermal Camera Images`
+- the gas classifier maps replayed readings into the hazard classes shown in the dashboard
+
+## Where To Put Files
+
+Put files in these exact locations:
+
+- CSV file:
+  [data/Gas_Sensors_Measurements.csv](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/data/Gas_Sensors_Measurements.csv)
+- thermal image root:
+  [data/Thermal Camera Images](/C:/Users/Rohan/OneDrive/Desktop/Material%20SES/Assignments/Agent%20Infra/industrial-safety-agent/data/Thermal%20Camera%20Images)
+
+Placement rules:
+
+- put `Gas_Sensors_Measurements.csv` directly inside `data/`
+- put thermal class folders directly inside `data/Thermal Camera Images/`
+- keep the class folder names aligned with the labels used in the project, such as `Mixture`, `NoGas`, `Perfume`, and `Smoke`
+
+Quick reference:
+
+```text
+Put CSV here:
+data/Gas_Sensors_Measurements.csv
+
+Put thermal image folders here:
+data/Thermal Camera Images/<class-folder>/
+```
 
 ## Local Folder Intent
 
@@ -59,5 +100,4 @@ This folder is treated as a checked-in local runtime asset directory for demos a
 
 ## Attribution
 
-Please retain attribution to the original Mendeley dataset and its contributors when redistributing or publishing results derived from this folder, in line with the dataset’s `CC BY 4.0` license.
-
+Please retain attribution to the original Mendeley dataset and its contributors when redistributing or publishing results derived from this folder, in line with the dataset's `CC BY 4.0` license.
